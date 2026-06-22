@@ -1,0 +1,39 @@
+import pandas as pd
+import numpy as np
+
+# Example columns:
+# time, my_forecast_mw, market_forecast_mw, day_ahead_price, intraday_price
+df = pd.read_csv("trading_data.csv", parse_dates=["time"])
+df = df.sort_values("time")
+
+# Forecast edge
+df["forecast_edge_mw"] = df["my_forecast_mw"] - df["market_forecast_mw"]
+
+# Simple trading rule
+threshold = 10  # MW
+
+df["signal"] = 0
+
+# If I expect much more renewable generation than market:
+# I expect price pressure downward
+df.loc[df["forecast_edge_mw"] > threshold, "signal"] = -1  # short / sell
+
+# If I expect much less renewable generation than market:
+# I expect price pressure upward
+df.loc[df["forecast_edge_mw"] < -threshold, "signal"] = 1  # long / buy
+
+# Profit calculation
+# If signal = 1, buy day-ahead and sell intraday
+# If signal = -1, sell day-ahead and buy back intraday
+df["profit_per_mwh"] = df["signal"] * (
+    df["intraday_price"] - df["day_ahead_price"]
+)
+
+trade_volume_mwh = 5
+df["profit_eur"] = df["profit_per_mwh"] * trade_volume_mwh
+
+total_profit = df["profit_eur"].sum()
+
+print("Total Profit EUR:", round(total_profit, 2))
+print("Number of Trades:", (df["signal"] != 0).sum())
+print("Average Profit per Trade:", round(df.loc[df["signal"] != 0, "profit_eur"].mean(), 2))
