@@ -1,0 +1,149 @@
+import pandas as pd
+import numpy as np
+
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+# -----------------------------
+# 1. Load weather forecasts
+# -----------------------------
+# Expected columns:
+# time
+# actual_power_mw
+# ecmwf_ghi, ecmwf_temp, ecmwf_wind
+# gfs_ghi, gfs_temp, gfs_wind
+
+df = pd.read_csv("forecast_weather_data.csv", parse_dates=["time"])
+df = df.sort_values("time")
+
+
+# ============================================================
+# 2. PVLIB PHYSICAL POWER MODEL
+# ============================================================
+import pvlib
+
+latitude = 51.23
+longitude = 6.78
+timezone = "Europe/Berlin"
+
+site = pvlib.location.Location(
+    latitude=latitude,
+    longitude=longitude,
+    tz=timezone
+)
+
+system_capacity_mw = 100
+tilt = 25
+azimuth = 180
+
+def pvlib_power_forecast(df, ghi_col, temp_col, wind_col, label):
+    solar_position = site.get_solarposition(df["time"])
+
+    dni = pvlib.irradiance.disc(
+        ghi=df[ghi_col],
+        solar_zenith=solar_position["zenith"],
+        datetime_or_doy=df["time"]
+    )["dni"].fillna(0)
+
+    dhi = df[ghi_col] - dni * np.cos(np.radians(solar_position["zenith"]))
+    dhi = dhi.clip(lower=0)
+
+    poa = pvlib.irradiance.get_total_irradiance(
+        surface_tilt=tilt,
+        surface_azimuth=azimuth,
+        dni=dni,
+        ghi=df[ghi_col],
+        dhi=dhi,
+        solar_zenith=solar_position["zenith"],
+        solar_azimuth=solar_position["azimuth"]
+    )["poa_global"].clip(lower=0)
+
+    cell_temp = pvlib.temperature.sapm_cell(
+        poa_global=poa,
+        temp_air=df[temp_col],
+        wind_speed=df[wind_col],
+        **pvlib.temperature.TEMPERATURE_MODEL_PARAMETERS["sapm"]["open_rack_glass_glass"]
+    )
+
+    temp_coeff = -0.004  # -0.4% per °C
+
+    power_mw = (
+        system_capacity_mw
+        * (poa / 1000)
+        * (1 + temp_coeff * (cell_temp - 25))
+    )
+
+    power_mw = power_mw.clip(lower=0, upper=system_capacity_mw)
+
+    df[f"{label}_pvlib_power_mw"] = power_mw
+
+    return df
+
+
+df = pvlib_power_forecast(
+    df,
+    ghi_col="ecmwf_ghi",
+    temp_col="ecmwf_temp",
+    wind_col="ecmwf_wind",
+    label="ecmwf"
+)
+
+df = pvlib_power_forecast(
+    df,
+    ghi_col="gfs_ghi",
+    temp_col="gfs_temp",
+    wind_col="gfs_wind",
+    label="gfs"
+)
+
+# ============================================================
+# END OF PVLIB SECTION
+# ============================================================
+
+
+# -----------------------------
+# 3. Benchmark individual forecasts
+# -----------------------------
+def evaluate(name, actual, forecast):
+    mae = mean_absolute_error(actual, forecast)
+    rmse = np.sqrt(mean_squared_error(actual, forecast))
+    bias = np.mean(forecast - actual)
+
+    print(name)
+    print(f"MAE  : {mae:.2f} MW")
+    print(f"RMSE : {rmse:.2f} MW")
+    print(f"Bias : {bias:.2f} MW")
+    print("-" * 30)
+
+evaluate("ECMWF + PVLib", df["actual_power_mw"], df["ecmwf_pvlib_power_mw"])
+evaluate("GFS + PVLib", df["actual_power_mw"], df["gfs_pvlib_power_mw"])
+
+
+# -----------------------------
+# 4. Dynamic weighted meta-forecast
+# -----------------------------
+# Lower rolling MAE = higher weight
+
+window = 24 * 30  # last 30 days if hourly data
+
+df["ecmwf_abs_error"] = abs(df["ecmwf_pvlib_power_mw"] - df["actual_power_mw"])
+df["gfs_abs_error"] = abs(df["gfs_pvlib_power_mw"] - df["actual_power_mw"])
+
+df["ecmwf_rolling_mae"] = df["ecmwf_abs_error"].rolling(window).mean()
+df["gfs_rolling_mae"] = df["gfs_abs_error"].rolling(window).mean()
+
+df["ecmwf_score"] = 1 / df["ecmwf_rolling_mae"]
+df["gfs_score"] = 1 / df["gfs_rolling_mae"]
+
+df["total_score"] = df["ecmwf_score"] + df["gfs_score"]
+
+df["ecmwf_weight"] = df["ecmwf_score"] / df["total_score"]
+df["gfs_weight"] = df["gfs_score"] / df["total_score"]
+
+df["meta_forecast_mw"] = (
+    df["ecmwf_weight"] * df["ecmwf_pvlib_power_mw"]
+    + df["gfs_weight"] * df["gfs_pvlib_power_mw"]
+)
+
+df = df.dropna()
+
+evaluate("Meta Forecast", df["actual_power_mw"], df["meta_forecast_mw"])
